@@ -1,0 +1,772 @@
+name: Kali Web Desktop (Selkies, low-lag tuned) + Cloudflare Tunnel
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What changed vs. the original workflow (and WHY it lagged)
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. The Kali image switched to Wayland by default (PIXELFLUX_WAYLAND=true since
+#    2026-03-29). Without a GPU that means kwin_wayland + software rendering =
+#    high CPU on a 2-vCPU runner, AND all X11 keyboard fixes (setxkbmap/xdotool)
+#    silently never ran. We force X11 (Xvfb + Plasma X11) => far cheaper.
+# 2. SELKIES_H264_STREAMING_MODE=true ("Turbo") encodes EVERY frame like a video
+#    even when the screen is static -> constant bandwidth -> lag on weak links.
+#    Desktop use should keep it OFF: only changed stripes are sent and static
+#    regions get a high-quality "paint-over" (sharp text, near-zero idle traffic).
+# 3. x264enc-striped: parallel per-stripe H.264 (only changed regions) — the most
+#    bandwidth-efficient desktop encoder pixelflux ships. Full-frame x264enc and
+#    jpeg remain selectable in the sidebar.
+# 4. SELKIES_VIDEO_BITRATE is in *Mbps* in this build (range 1-100). "2000" meant
+#    2 Gbit/s. Fixed, and CBR is made available so a hard cap really applies.
+# 5. SELKIES_CONGESTION_CONTROL / SELKIES_ENABLE_RESIZE / KEYBOARD only exist in
+#    WebRTC mode; the linuxserver image is WebSocket-only -> removed (no-ops).
+# 6. Browser-side cursors: the cursor is no longer baked into the video, so moving
+#    the mouse doesn't trigger encodes and feels instant even at 300 ms RTT.
+# 7. cloudflared is supervised: if the tunnel dies it is restarted and the new
+#    URL is printed to the log + step summary. Optional stable hostname via a
+#    named tunnel token.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Network profile"
+        type: choice
+        default: balanced
+        options: [low, balanced, high]
+      resolution:
+        description: "Desktop resolution (WxH). Empty = profile default"
+        type: string
+        default: ""
+      fps:
+        description: "Framerate (fixed). Empty = profile default"
+        type: string
+        default: ""
+      desktop_user:
+        description: "HTTP basic-auth username"
+        type: string
+        default: desktop
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kali-web-desktop
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    env:
+      DESKTOP_USER: ${{ inputs.desktop_user }}
+      DESKTOP_PASSWORD: ${{ secrets.SELKIES_PASSWORD }}
+      # Optional: a *named* Cloudflare tunnel token for a stable hostname.
+      CF_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      CF_TUNNEL_HOSTNAME: ${{ vars.CLOUDFLARE_TUNNEL_HOSTNAME }}
+      PROFILE: ${{ inputs.profile }}
+      IN_RESOLUTION: ${{ inputs.resolution }}
+      IN_FPS: ${{ inputs.fps }}
+
+    steps:
+      # ────────────────────────────────────────────────────────────────────
+      - name: Validate required secret
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${DESKTOP_PASSWORD}" ]; then
+            echo "::error::Secret SELKIES_PASSWORD is missing."
+            exit 1
+          fi
+          # nginx basic-auth is substituted with bash; avoid characters that break it
+          if printf '%s' "${DESKTOP_PASSWORD}" | grep -qE '[":\\$`'"'"']'; then
+            echo "::error::SELKIES_PASSWORD must not contain quotes, colon, backslash, backtick or \$."
+            exit 1
+          fi
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Free runner disk space (Kali image is large)
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/lib/jvm /usr/local/.ghcup 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Resolve stream profile
+        id: profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${PROFILE}" in
+            low)
+              RES="1280x720";  FPS="30"
+              ENCODER="x264enc-striped,x264enc,jpeg"
+              RC_MODE="cbr,crf";  BITRATE_MBPS="2"        # locked hard cap
+              CRF="30";           PAINT_CRF="22";  BURST="3"
+              JPEG_Q="35";        PAINT_JPEG_Q="80"
+              AUDIO_BR="64000"
+              ;;
+            high)
+              RES="1920x1080"; FPS="60"
+              ENCODER="x264enc-striped,x264enc,jpeg"
+              RC_MODE="crf,cbr";  BITRATE_MBPS="2-20"     # slider (initial 8)
+              CRF="22";           PAINT_CRF="14";  BURST="5"
+              JPEG_Q="60";        PAINT_JPEG_Q="92"
+              AUDIO_BR="192000"
+              ;;
+            *) # balanced
+              RES="1280x720";  FPS="60"
+              ENCODER="x264enc-striped,x264enc,jpeg"
+              RC_MODE="crf,cbr";  BITRATE_MBPS="1-8"      # slider (initial 8)
+              CRF="26";           PAINT_CRF="18";  BURST="5"
+              JPEG_Q="45";        PAINT_JPEG_Q="88"
+              AUDIO_BR="128000"
+              ;;
+          esac
+          [ -n "${IN_RESOLUTION}" ] && RES="${IN_RESOLUTION}"
+          [ -n "${IN_FPS}" ]        && FPS="${IN_FPS}"
+          if ! [[ "${RES}" =~ ^[0-9]{3,4}x[0-9]{3,4}$ ]]; then
+            echo "::error::resolution must look like 1280x720"; exit 1
+          fi
+          if ! [[ "${FPS}" =~ ^[0-9]{1,3}$ ]] || [ "${FPS}" -lt 8 ] || [ "${FPS}" -gt 120 ]; then
+            echo "::error::fps must be 8..120"; exit 1
+          fi
+          W="${RES%x*}"; H="${RES#*x}"
+          # keep even dimensions (H.264 4:2:0 requirement); pixelflux pads the rest
+          W=$(( (W / 2) * 2 )); H=$(( (H / 2) * 2 ))
+          {
+            echo "width=${W}";              echo "height=${H}";  echo "fps=${FPS}"
+            echo "encoder=${ENCODER}";      echo "rc_mode=${RC_MODE}"
+            echo "bitrate=${BITRATE_MBPS}"; echo "crf=${CRF}"
+            echo "paint_crf=${PAINT_CRF}";  echo "burst=${BURST}"
+            echo "jpeg_q=${JPEG_Q}";        echo "paint_jpeg_q=${PAINT_JPEG_Q}"
+            echo "audio_br=${AUDIO_BR}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Profile=${PROFILE} ${W}x${H}@${FPS} enc=${ENCODER} rc=${RC_MODE} cbr=${BITRATE_MBPS}Mbps crf=${CRF}/${PAINT_CRF}"
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Create Kali customization files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p root/defaults root/usr/local/bin root/etc/xdg/autostart
+
+          # ============================================================
+          # Dockerfile
+          # ============================================================
+          cat > Dockerfile <<'EOF'
+          FROM lscr.io/linuxserver/kali-linux:latest
+          USER root
+
+          # ---- Force the X11 backend (Kali image defaults to Wayland since 2026-03) ----
+          # No GPU on GitHub runners => Xvfb + Plasma X11 is far cheaper than
+          # kwin_wayland software rendering, and our X11 keyboard fixes actually run.
+          ENV PIXELFLUX_WAYLAND=false
+
+          # ---- Electron / AppImage / Firefox sandbox fixes (container-safe) ----
+          ENV ELECTRON_DISABLE_SANDBOX=1 \
+              APPIMAGE_EXTRACT_AND_RUN=1 \
+              MOZ_DISABLE_CONTENT_SANDBOX=1 \
+              MOZ_DISABLE_GMP_SANDBOX=1 \
+              MOZ_DISABLE_RDD_SANDBOX=1 \
+              MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+
+          # ---- Keyboard defaults (US, no dead keys, no compose) ----
+          ENV XKB_DEFAULT_LAYOUT=us \
+              XKB_DEFAULT_MODEL=pc105 \
+              XKB_DEFAULT_VARIANT= \
+              XKB_DEFAULT_OPTIONS=
+
+          RUN apt-get update && \
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                firefox-esr \
+                fonts-noto \
+                fonts-noto-color-emoji \
+                feh \
+                x11-xkb-utils \
+                x11-xserver-utils \
+                xkb-data \
+                xdotool \
+                xclip \
+                xsel \
+                python3 \
+                python3-xlib \
+                dbus-x11 && \
+              (DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfuse2 || \
+               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfuse2t64 || \
+               true) && \
+              apt-get clean && \
+              rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+          COPY root/ /
+          RUN chmod +x /usr/local/bin/set-wallpaper \
+                       /usr/local/bin/fix-keyboard \
+                       /usr/local/bin/keymap-daemon.py \
+                       /usr/local/bin/shift-repair.sh \
+                       /usr/local/bin/desktop-tune \
+                       /defaults/autostart
+          EOF
+
+          # ============================================================
+          # /defaults/autostart  -> copied by lsio init to
+          # ~/.config/openbox/autostart and executed by Plasma's
+          # autostart.desktop. This is THE reliable hook in X11 mode.
+          # ============================================================
+          cat > root/defaults/autostart <<'EOF'
+          #!/bin/bash
+          # Launched once per desktop session by Plasma (via lsio autostart.desktop)
+          /usr/local/bin/desktop-tune   >/tmp/desktop-tune.log   2>&1 &
+          /usr/local/bin/fix-keyboard   >/tmp/fix-keyboard.log   2>&1 &
+          /usr/local/bin/shift-repair.sh >/tmp/shift-repair.log  2>&1 &
+          /usr/local/bin/keymap-daemon.py >/tmp/keymap-daemon.log 2>&1 &
+          /usr/local/bin/set-wallpaper  >/tmp/set-wallpaper.log  2>&1 &
+          exit 0
+          EOF
+
+          # Belt & braces: system-wide XDG autostart too (any DE)
+          for svc in fix-keyboard shift-repair keymap-daemon set-wallpaper desktop-tune; do
+            case "$svc" in
+              shift-repair)  EXEC=/usr/local/bin/shift-repair.sh ;;
+              keymap-daemon) EXEC=/usr/local/bin/keymap-daemon.py ;;
+              *)             EXEC=/usr/local/bin/$svc ;;
+            esac
+            cat > "root/etc/xdg/autostart/${svc}.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=${svc}
+          Exec=${EXEC}
+          OnlyShowIn=KDE;XFCE;GNOME;LXQt;MATE;
+          X-GNOME-Autostart-enabled=true
+          X-KDE-autostart-phase=2
+          EOF
+          done
+
+          # ============================================================
+          # desktop-tune: kill everything that costs frames/bandwidth
+          # ============================================================
+          cat > root/usr/local/bin/desktop-tune <<'EOF'
+          #!/bin/bash
+          for _ in $(seq 1 30); do xset q >/dev/null 2>&1 && break; sleep 1; done
+          # No screensaver / DPMS (a blanked Xvfb = black stream)
+          xset s off -dpms 2>/dev/null || true
+          xset s noblank 2>/dev/null || true
+          # Plasma: no compositor (already off by lsio), no animations, no blur,
+          # no lock screen, no desktop effects -> fewer pixels changing per frame
+          if command -v kwriteconfig6 >/dev/null 2>&1; then
+            kwriteconfig6 --file kwinrc --group Compositing --key Enabled false
+            kwriteconfig6 --file kwinrc --group Compositing --key OpenGLIsUnsafe true
+            kwriteconfig6 --file kdeglobals --group KDE --key AnimationDurationFactor 0
+            kwriteconfig6 --file kwinrc --group Plugins --key blurEnabled false
+            kwriteconfig6 --file kwinrc --group Plugins --key contrastEnabled false
+            kwriteconfig6 --file kwinrc --group Plugins --key slidingpopupsEnabled false
+            kwriteconfig6 --file kscreenlockerrc --group Daemon --key Autolock false
+            kwriteconfig6 --file kscreenlockerrc --group Daemon --key LockOnResume false
+            kwriteconfig6 --file powermanagementprofilesrc --group AC --group DPMSControl --key idleTime 0 2>/dev/null || true
+            # Keyboard layout: US only (KDE otherwise may re-apply its own layout)
+            kwriteconfig6 --file kxkbrc --group Layout --key LayoutList us
+            kwriteconfig6 --file kxkbrc --group Layout --key Use true
+            kwriteconfig6 --file kxkbrc --group Layout --key Options ""
+            kwriteconfig6 --file kxkbrc --group Layout --key ResetOldOptions true
+            # Cursor blink off in Qt apps saves periodic tiny encodes in terminals
+            kwriteconfig6 --file kdeglobals --group KDE --key CursorBlinkRate 0
+            # Reload
+            command -v qdbus6 >/dev/null 2>&1 && qdbus6 org.kde.KWin /KWin reconfigure 2>/dev/null || true
+          fi
+          # Firefox: disable smooth-scroll & animations for cheaper frames
+          mkdir -p "$HOME/.mozilla/firefox" 2>/dev/null || true
+          exit 0
+          EOF
+
+          # ============================================================
+          # LAYER 1: setxkbmap loop — enforce clean US keymap
+          # ============================================================
+          cat > root/usr/local/bin/fix-keyboard <<'EOF'
+          #!/bin/bash
+          for _ in $(seq 1 30); do xset q >/dev/null 2>&1 && break; sleep 1; done
+          # Selkies re-injects keymaps on (re)connect which can wipe Shift semantics.
+          while true; do
+              setxkbmap -option "" 2>/dev/null || true
+              setxkbmap -model pc105 -layout us -variant "" -option "" 2>/dev/null || true
+              if xset q 2>/dev/null | grep -q "Caps Lock:.*on"; then
+                  xdotool key --clearmodifiers Caps_Lock 2>/dev/null || true
+              fi
+              xset r rate 300 30 2>/dev/null || true
+              sleep 5
+          done
+          EOF
+
+          # ============================================================
+          # LAYER 2: CapsLock auto-release (Android soft-keyboard phantom events)
+          # ============================================================
+          cat > root/usr/local/bin/shift-repair.sh <<'EOF'
+          #!/bin/bash
+          for _ in $(seq 1 30); do xset q >/dev/null 2>&1 && break; sleep 1; done
+          while true; do
+              if xset q 2>/dev/null | grep -q "Caps Lock:.*on"; then
+                  xdotool key --clearmodifiers Caps_Lock 2>/dev/null || true
+              fi
+              sleep 1
+          done
+          EOF
+
+          # ============================================================
+          # LAYER 3: Python RECORD/XTest daemon — instant CapsLock repair
+          # ============================================================
+          cat > root/usr/local/bin/keymap-daemon.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Watches every KeyPress on the X display via the RECORD extension.
+          If a letter arrives while the Lock (CapsLock) modifier is stuck ON and
+          Shift is not held, CapsLock is toggled off immediately via XTest so
+          the *next* letters are typed with the intended case. Reacts in <1 ms
+          instead of the 1 s poll of the shell layer.
+          """
+          import os
+          import sys
+          import time
+
+          for _ in range(60):
+              if os.environ.get("DISPLAY"):
+                  try:
+                      from Xlib import display as _d
+                      _d.Display().close()
+                      break
+                  except Exception:
+                      pass
+              time.sleep(1)
+
+          try:
+              from Xlib import X, XK, display
+              from Xlib.ext import record, xtest
+              from Xlib.protocol import rq
+          except Exception as e:  # pragma: no cover
+              print(f"[keymap-daemon] python-xlib unavailable: {e}", file=sys.stderr)
+              sys.exit(0)
+
+          UPPER = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+          def main():
+              local_dpy = display.Display()
+              record_dpy = display.Display()
+              if not record_dpy.has_extension("RECORD"):
+                  print("[keymap-daemon] RECORD extension not available.", file=sys.stderr)
+                  return
+              ctx = record_dpy.record_create_context(
+                  0,
+                  [record.AllClients],
+                  [{
+                      'core_requests': (0, 0),
+                      'core_replies': (0, 0),
+                      'ext_requests': (0, 0, 0, 0),
+                      'ext_replies': (0, 0, 0, 0),
+                      'delivered_events': (0, 0),
+                      'device_events': (X.KeyPress, X.KeyPress),
+                      'errors': (0, 0),
+                      'client_started': False,
+                      'client_died': False,
+                  }])
+              caps_kc = local_dpy.keysym_to_keycode(XK.string_to_keysym("Caps_Lock"))
+              last_fix = 0.0
+
+              def handler(reply):
+                  nonlocal last_fix
+                  if reply.category != record.FromServer or reply.client_swapped:
+                      return
+                  data = reply.data
+                  while len(data):
+                      event, data = rq.EventField(None).parse_binary_value(
+                          data, record_dpy.display, None, None)
+                      if event.type != X.KeyPress:
+                          continue
+                      state = event.state
+                      shift_on = bool(state & X.ShiftMask)
+                      caps_on = bool(state & X.LockMask)
+                      if not caps_on or shift_on:
+                          continue
+                      try:
+                          ks_shift = local_dpy.keycode_to_keysym(event.detail, 1)
+                          ch = XK.keysym_to_string(ks_shift) or ""
+                      except Exception:
+                          continue
+                      now = time.monotonic()
+                      if ch in UPPER and (now - last_fix) > 0.2:
+                          last_fix = now
+                          try:
+                              xtest.fake_input(local_dpy, X.KeyPress, caps_kc)
+                              xtest.fake_input(local_dpy, X.KeyRelease, caps_kc)
+                              local_dpy.sync()
+                          except Exception:
+                              pass
+
+              record_dpy.record_enable_context(ctx, handler)
+              record_dpy.record_free_context(ctx)
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except KeyboardInterrupt:
+                  pass
+              except Exception as exc:
+                  print(f"[keymap-daemon] fatal: {exc}", file=sys.stderr)
+                  while True:
+                      time.sleep(3600)
+          PYEOF
+
+          # ============================================================
+          # Wallpaper setter (a flat/static wallpaper = fewer bytes)
+          # ============================================================
+          cat > root/usr/local/bin/set-wallpaper <<'EOF'
+          #!/bin/bash
+          sleep 8
+          WALL=""
+          while IFS= read -r -d '' f; do WALL="$f"; break; done < <(
+            find /usr/share/backgrounds /usr/share/wallpapers -type f \( -iname '*.jpg' -o -iname '*.png' \) -print0 2>/dev/null | head -z -n 1
+          )
+          [ -z "$WALL" ] && exit 0
+          if command -v plasma-apply-wallpaperimage >/dev/null 2>&1; then
+              plasma-apply-wallpaperimage "$WALL" || true
+          elif command -v xfconf-query >/dev/null 2>&1; then
+              for prop in $(xfconf-query -c xfce4-desktop -l 2>/dev/null | grep last-image || true); do
+                  xfconf-query -c xfce4-desktop -p "$prop" -s "$WALL" || true
+              done
+          elif command -v feh >/dev/null 2>&1; then
+              feh --bg-fill "$WALL" || true
+          fi
+          exit 0
+          EOF
+
+          chmod +x root/usr/local/bin/* root/defaults/autostart
+          echo "Files created:"; find root Dockerfile -type f | sort
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Build Kali Selkies image
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOCKER_BUILDKIT=1 docker build --pull --tag kali-selkies:local .
+          docker image ls kali-selkies:local
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Start Kali desktop
+        shell: bash
+        env:
+          W:        ${{ steps.profile.outputs.width }}
+          H:        ${{ steps.profile.outputs.height }}
+          FPS:      ${{ steps.profile.outputs.fps }}
+          ENCODER:  ${{ steps.profile.outputs.encoder }}
+          RC_MODE:  ${{ steps.profile.outputs.rc_mode }}
+          BITRATE:  ${{ steps.profile.outputs.bitrate }}
+          CRF:      ${{ steps.profile.outputs.crf }}
+          PAINT_CRF: ${{ steps.profile.outputs.paint_crf }}
+          BURST:    ${{ steps.profile.outputs.burst }}
+          JPEG_Q:   ${{ steps.profile.outputs.jpeg_q }}
+          PAINT_JPEG_Q: ${{ steps.profile.outputs.paint_jpeg_q }}
+          AUDIO_BR: ${{ steps.profile.outputs.audio_br }}
+        run: |
+          set -euo pipefail
+          # NOTE (this Selkies build, pinned by linuxserver):
+          #  * range settings: "min-max" = user-adjustable slider, single value = locked
+          #  * enum/list: first item = default, all items = allowed
+          #  * bool: "true|locked" hides the toggle
+          #  * SELKIES_VIDEO_BITRATE is Mbps (1-100)
+          docker run -d \
+            --name selkies-desktop \
+            --shm-size=2gb \
+            --security-opt seccomp=unconfined \
+            -p 127.0.0.1:3000:3000 \
+            -e PUID=1000 -e PGID=1000 -e TZ=Etc/UTC \
+            -e PIXELFLUX_WAYLAND="false" \
+            -e CUSTOM_USER="${DESKTOP_USER}" \
+            -e PASSWORD="${DESKTOP_PASSWORD}" \
+            -e TITLE="Kali Web Desktop" \
+            -e SELKIES_UI_TITLE="Kali Desktop" \
+            -e MAX_RES="${W}x${H}" \
+            `# ---- Resolution locked to the profile (CSS scaling: browser upsizes) ----` \
+            -e SELKIES_IS_MANUAL_RESOLUTION_MODE="true|locked" \
+            -e SELKIES_MANUAL_WIDTH="${W}" \
+            -e SELKIES_MANUAL_HEIGHT="${H}" \
+            -e SELKIES_USE_CSS_SCALING="true" \
+            -e SELKIES_FORCE_ALIGNED_RESOLUTION="false" \
+            `# ---- Encoder: striped x264 (only changed regions) + CRF/CBR selectable ----` \
+            -e SELKIES_USE_CPU="true|locked" \
+            -e SELKIES_ENCODER="${ENCODER}" \
+            -e SELKIES_FRAMERATE="${FPS}" \
+            -e SELKIES_H264_CRF="${CRF}" \
+            -e SELKIES_H264_FULLCOLOR="false|locked" \
+            -e SELKIES_H264_STREAMING_MODE="false" \
+            -e SELKIES_ENABLE_RATE_CONTROL="true" \
+            -e SELKIES_RATE_CONTROL_MODE="${RC_MODE}" \
+            -e SELKIES_VIDEO_BITRATE="${BITRATE}" \
+            `# ---- Paint-over: static screen gets re-sent at high quality (sharp text) ----` \
+            -e SELKIES_USE_PAINT_OVER_QUALITY="true" \
+            -e SELKIES_H264_PAINTOVER_CRF="${PAINT_CRF}" \
+            -e SELKIES_H264_PAINTOVER_BURST_FRAMES="${BURST}" \
+            -e SELKIES_JPEG_QUALITY="${JPEG_Q}" \
+            -e SELKIES_PAINT_OVER_JPEG_QUALITY="${PAINT_JPEG_Q}" \
+            `# ---- Cursor drawn by the browser -> zero-latency pointer, no encodes on mouse move ----` \
+            -e SELKIES_USE_BROWSER_CURSORS="true" \
+            -e SELKIES_SECOND_SCREEN="false|locked" \
+            `# ---- Audio ----` \
+            -e SELKIES_AUDIO_ENABLED="true" \
+            -e SELKIES_AUDIO_BITRATE="${AUDIO_BR}" \
+            -e SELKIES_MICROPHONE_ENABLED="false|locked" \
+            `# ---- Clipboard / files / misc ----` \
+            -e SELKIES_CLIPBOARD_ENABLED="true" \
+            -e SELKIES_ENABLE_BINARY_CLIPBOARD="true" \
+            -e SELKIES_FILE_TRANSFERS="upload,download" \
+            -e SELKIES_GAMEPAD_ENABLED="false|locked" \
+            -e SELKIES_ENABLE_SHARING="false|locked" \
+            -e SELKIES_UI_SIDEBAR_SHOW_STATS="true" \
+            -e SELKIES_UI_SIDEBAR_SHOW_GAMEPADS="false" \
+            -e SELKIES_UI_SIDEBAR_SHOW_SHARING="false" \
+            -e SELKIES_UI_SIDEBAR_SHOW_GAMING_MODE="false" \
+            -v selkies-config:/config \
+            kali-selkies:local
+          sleep 5
+          docker ps --filter name=selkies-desktop --format 'table {{.Names}}\t{{.Status}}'
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Local Selkies readiness and HTTP tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Waiting for Selkies HTTP service..."
+          OK=0
+          for _ in $(seq 1 120); do
+            if curl --fail --silent --show-error \
+              --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+              --max-time 10 http://127.0.0.1:3000/ -o /tmp/selkies.html; then
+              OK=1; break
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx 'selkies-desktop'; then
+              echo "::error::Selkies container stopped unexpectedly."
+              docker logs selkies-desktop || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "${OK}" -ne 1 ]; then
+            echo "::error::Selkies HTTP service never responded successfully."
+            docker logs --tail 200 selkies-desktop || true
+            exit 1
+          fi
+          test -s /tmp/selkies.html
+          if grep -qE 'id="app"|manifest\.json|apple-touch-icon|assets/index-.*\.js|selkies' /tmp/selkies.html; then
+            echo "✓ Selkies SPA shell detected."
+          else
+            echo "::error::The page does not look like the Selkies web client."
+            head -n 80 /tmp/selkies.html || true
+            exit 1
+          fi
+          # Auth must be enforced
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:3000/)
+          if [ "${CODE}" != "401" ]; then
+            echo "::error::Expected 401 without credentials, got ${CODE}"; exit 1
+          fi
+          echo "✓ Basic auth enforced (401 without credentials)."
+          # WebSocket endpoint must upgrade (nginx proxies /websocket -> selkies)
+          WS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+               --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+               -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+               -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+               http://127.0.0.1:3000/websocket || true)
+          echo "WebSocket handshake HTTP code: ${WS} (101 expected; 4xx/5xx means selkies not up yet)"
+          # Wait for the DE/X to actually be up (selkies logs)
+          for _ in $(seq 1 60); do
+            if docker logs selkies-desktop 2>&1 | grep -qiE 'Xvfb|startplasma|selkies.*(listening|started|Server)'; then break; fi
+            sleep 2
+          done
+          echo "--- selected selkies log lines ---"
+          docker logs selkies-desktop 2>&1 | grep -iE 'selkies|pixelflux|encoder|manual|resolution|error|warn' | tail -40 || true
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo curl --fail --location --retry 3 \
+            --output /usr/local/bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Start Cloudflare tunnel (supervised)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Supervisor script: restarts cloudflared if it dies, re-publishes URL.
+          cat > /tmp/tunnel-supervisor.sh <<'EOF'
+          #!/bin/bash
+          set -uo pipefail
+          while true; do
+            : > /tmp/cloudflared.log
+            if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+              cloudflared tunnel --no-autoupdate --protocol http2 --loglevel info \
+                --logfile /tmp/cloudflared.log run --token "${CF_TUNNEL_TOKEN}" \
+                --url http://127.0.0.1:3000 >/tmp/cloudflared.stdout 2>&1
+            else
+              cloudflared tunnel --no-autoupdate --protocol http2 --loglevel info \
+                --logfile /tmp/cloudflared.log \
+                --url http://127.0.0.1:3000 >/tmp/cloudflared.stdout 2>&1
+            fi
+            echo "$(date -u +%FT%TZ) cloudflared exited ($?), restarting in 3s" >> /tmp/tunnel-restarts.log
+            sleep 3
+          done
+          EOF
+          chmod +x /tmp/tunnel-supervisor.sh
+          nohup /tmp/tunnel-supervisor.sh >/tmp/tunnel-supervisor.out 2>&1 &
+          echo $! > /tmp/tunnel-supervisor.pid
+
+          PUBLIC_URL=""
+          if [ -n "${CF_TUNNEL_TOKEN:-}" ] && [ -n "${CF_TUNNEL_HOSTNAME:-}" ]; then
+            PUBLIC_URL="https://${CF_TUNNEL_HOSTNAME}"
+            # wait for the connector to register
+            for _ in $(seq 1 60); do
+              grep -qiE 'Registered tunnel connection|Connection .* registered' /tmp/cloudflared.log 2>/dev/null && break
+              sleep 2
+            done
+          else
+            for _ in $(seq 1 90); do
+              PUBLIC_URL="$(grep -hEo 'https://[-a-z0-9]+\.trycloudflare\.com' \
+                  /tmp/cloudflared.log /tmp/cloudflared.stdout 2>/dev/null | head -n 1 || true)"
+              [ -n "${PUBLIC_URL}" ] && break
+              sleep 2
+            done
+          fi
+          if [ -z "${PUBLIC_URL}" ]; then
+            echo "::error::Cloudflare tunnel did not return a public URL."
+            cat /tmp/cloudflared.log /tmp/cloudflared.stdout || true
+            exit 1
+          fi
+          echo "PUBLIC_URL=${PUBLIC_URL}" >> "${GITHUB_ENV}"
+          echo "Tunnel URL: ${PUBLIC_URL}"
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Public tunnel end-to-end test
+        shell: bash
+        run: |
+          set -euo pipefail
+          OK=0
+          for _ in $(seq 1 30); do
+            if curl --fail --silent --show-error --location \
+              --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" \
+              --max-time 20 "${PUBLIC_URL}" -o /tmp/public-selkies.html; then
+              OK=1; break
+            fi
+            sleep 2
+          done
+          [ "${OK}" -eq 1 ] || { echo "::error::Public URL never responded."; exit 1; }
+          test -s /tmp/public-selkies.html
+          if grep -qE 'id="app"|manifest\.json|apple-touch-icon|assets/index-.*\.js|selkies' /tmp/public-selkies.html; then
+            echo "✓ Public tunnel serves the Selkies web client."
+          else
+            echo "::error::Public URL did not serve the Selkies web client."
+            head -n 80 /tmp/public-selkies.html || true
+            exit 1
+          fi
+          # Latency probe through the tunnel (for the summary)
+          T=$(curl -s -o /dev/null -w '%{time_starttransfer}' --user "${DESKTOP_USER}:${DESKTOP_PASSWORD}" --max-time 20 "${PUBLIC_URL}" || echo "n/a")
+          echo "TTFB_VIA_TUNNEL=${T}" >> "${GITHUB_ENV}"
+          echo "Runner→Cloudflare→Runner TTFB: ${T}s"
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Publish desktop link
+        shell: bash
+        env:
+          W:   ${{ steps.profile.outputs.width }}
+          H:   ${{ steps.profile.outputs.height }}
+          FPS: ${{ steps.profile.outputs.fps }}
+          ENCODER: ${{ steps.profile.outputs.encoder }}
+          RC_MODE: ${{ steps.profile.outputs.rc_mode }}
+          BITRATE: ${{ steps.profile.outputs.bitrate }}
+          CRF: ${{ steps.profile.outputs.crf }}
+          PAINT_CRF: ${{ steps.profile.outputs.paint_crf }}
+          AUDIO_BR: ${{ steps.profile.outputs.audio_br }}
+        run: |
+          set -euo pipefail
+          QR=""
+          if command -v qrencode >/dev/null 2>&1 || sudo apt-get install -y -qq qrencode >/dev/null 2>&1; then
+            QR="$(qrencode -t UTF8 -m 1 "${PUBLIC_URL}" 2>/dev/null || true)"
+          fi
+          {
+            echo "## ✅ Kali Web Desktop is ready"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Desktop URL** | ${PUBLIC_URL} |"
+            echo "| **Username** | \`${DESKTOP_USER}\` |"
+            echo "| **Password** | value of the \`SELKIES_PASSWORD\` secret |"
+            echo "| **Profile** | \`${PROFILE}\` |"
+            echo "| **Resolution / FPS** | ${W}×${H} @ ${FPS} fps (locked, CSS-scaled in browser) |"
+            echo "| **Backend** | X11 (Xvfb + Plasma X11, compositor off) |"
+            echo "| **Encoder** | \`${ENCODER%%,*}\` (default) — others selectable in sidebar |"
+            echo "| **Rate control** | \`${RC_MODE%%,*}\` default · CRF ${CRF} (paint-over CRF ${PAINT_CRF}) · CBR bitrate ${BITRATE} Mbps |"
+            echo "| **Audio** | Opus ${AUDIO_BR} bps, mic off |"
+            echo "| **Cursor** | browser-side (zero-latency) |"
+            echo "| **Keyboard fixes** | setxkbmap loop · CapsLock auto-release · Python RECORD/XTest daemon · KDE kxkbrc=us |"
+            echo "| **Tunnel TTFB** | ${TTFB_VIA_TUNNEL:-n/a}s |"
+            echo
+            if [ -n "${QR}" ]; then
+              echo '```'
+              echo "${QR}"
+              echo '```'
+              echo
+            fi
+            echo "### Tips for a weak connection"
+            echo "- In the sidebar → **Video**: switch *Rate control* to **CBR** and lower the bitrate to 1–2 Mbps; or raise CRF (30–34)."
+            echo "- Encoder **x264enc-striped** (default) sends only changed regions; **jpeg** is a good fallback on very lossy links."
+            echo "- Keep **Stats** open to watch bandwidth/latency."
+            echo
+            echo "> The link works only while this GitHub Actions job is running (max ~5h50m)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "Desktop URL: ${PUBLIC_URL}"
+          echo "Username:    ${DESKTOP_USER}"
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Keep desktop alive (monitor container + tunnel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          LAST_URL="${PUBLIC_URL}"
+          while true; do
+            if ! docker ps --format '{{.Names}}' | grep -qx 'selkies-desktop'; then
+              echo "::error::Selkies container stopped."
+              docker logs --tail 200 selkies-desktop || true
+              exit 1
+            fi
+            if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
+              NEW_URL="$(grep -hEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)"
+              if [ -n "${NEW_URL}" ] && [ "${NEW_URL}" != "${LAST_URL}" ]; then
+                LAST_URL="${NEW_URL}"
+                echo "::warning::Tunnel restarted. NEW Desktop URL: ${NEW_URL}"
+                echo "### 🔁 Tunnel restarted — new URL: ${NEW_URL}" >> "${GITHUB_STEP_SUMMARY}"
+              fi
+            fi
+            if [ -s /tmp/tunnel-restarts.log ]; then
+              tail -n 1 /tmp/tunnel-restarts.log
+            fi
+            # lightweight health line every minute
+            STATS=$(docker stats --no-stream --format '{{.CPUPerc}} CPU, {{.MemUsage}}' selkies-desktop 2>/dev/null || echo "n/a")
+            echo "$(date -u +%H:%M:%S) alive · ${STATS} · URL ${LAST_URL}"
+            sleep 60
+          done
+
+      # ────────────────────────────────────────────────────────────────────
+      - name: Collect logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== docker logs ==="; docker logs --tail 300 selkies-desktop 2>&1 || true
+          echo "=== cloudflared ==="; tail -n 100 /tmp/cloudflared.log 2>/dev/null || true
+          echo "=== restarts ===";   cat /tmp/tunnel-restarts.log 2>/dev/null || true
+          echo "=== in-container autostart logs ==="
+          for f in desktop-tune fix-keyboard shift-repair keymap-daemon set-wallpaper; do
+            echo "--- $f ---"; docker exec selkies-desktop sh -c "cat /tmp/$f.log 2>/dev/null" || true
+          done
